@@ -27,40 +27,36 @@ def could_be_same_sv(sv_cluster1, sv_cluster2):
 #
 #	ASSUMES INPUT LISTS ARE SORTED
 #
-
-def subtractive_filter(myList, items_to_remove):
+def sv_filter(list1,list2,op='subtract'):
+	if op not in ['subtract','intersect']:
+		print '\nError: filter op must be "subtract" or "intersect"\n'
+		exit(1)
 	outList = []
-	j0 = 0
-	for i in xrange(len(myList)):
-		toRemove = False
-		while items_to_remove[j0][0][1] <= myList[i][0][0]:
-			j0 += 1
-		for j in xrange(j0,len(items_to_remove)):
-			if could_be_same_sv(myList[i][1],items_to_remove[j][1]):
-				toRemove = True
-				break
-			if items_to_remove[j][0][0] > myList[i][0][1]:
-				break
-		if toRemove == False:
-			outList.append(myList[i])
-	return outList
+	chrMap  = {}
+	for i in xrange(len(list1)):
+		mc1 = list1[i][0][0]
+		if mc1 not in chrMap:
+			chrMap[mc1] = [i,None]
+	for i in xrange(len(list2)):
+		mc2 = list2[i][0][0]
+		if mc2 in chrMap and chrMap[mc2][1] == None:
+			chrMap[mc2][1] = i
 
+	for i in xrange(len(list1)):
+		j0    = chrMap[list1[i][0][0]][1]
+		in_l2 = False
+		if j0 != None:
+			for j in xrange(j0,len(list2)):
+				if list2[j][0][0] != list1[i][0][0] or list2[j][0][1] > list1[i][0][2]:
+					break
+				if could_be_same_sv(list1[i][1],list2[j][1]):
+					in_l2 = True
+					break
+		if op == 'intersect' and in_l2:
+			outList.append(list1[i])
+		elif op == 'subtract' and not(in_l2):
+			outList.append(list1[i])
 
-def intersection_filter(myList1, myList2):
-	outList = []
-	j0 = 0
-	for i in xrange(len(myList)):
-		isFound = False
-		while myList2[j0][0][1] <= myList[i][0][0]:
-			j0 += 1
-		for j in xrange(j0,len(myList2)):
-			if could_be_same_sv(myList[i][1],myList2[j][1]):
-				isFound = True
-				break
-			if myList2[j][0][0] > myList[i][0][1]:
-				break
-		if isFound == True:
-			outList.append(myList[i])
 	return outList
 
 
