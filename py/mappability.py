@@ -3,7 +3,7 @@ import bisect
 # mappability track
 class MappabilityTrack:
 	def __init__(self, bedfile):
-		print 'reading input mappability track...'
+		#print 'reading input mappability track...'
 		f = open(bedfile,'r')
 		self.all_tracks = {}
 		for line in f:

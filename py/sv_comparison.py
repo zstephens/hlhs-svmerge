@@ -1,3 +1,4 @@
+import copy
 
 # how far away can SV call positions be such that we'll still consider them the same event?
 ENDPOINT_BUFFER = 150
@@ -58,5 +59,32 @@ def sv_filter(list1,list2,op='subtract'):
 			outList.append(list1[i])
 
 	return outList
+
+
+#
+# return events that are unique to one sample, compared to all others
+#
+def get_denovo(all_svs,samp_name):
+	denovo = all_svs[samp_name]
+	for k in all_svs.keys():
+		#print len(denovo),'-->',
+		if k != samp_name:
+			denovo = sv_filter(denovo,all_svs[k])
+		#print len(denovo)
+	return denovo
+
+
+#
+# produce a nested dictionary [samp1][samp2] = all common svs between samp1 & samp2
+#
+def pairwise_all_samples(all_svs):
+	out_dict = {}
+	for k in sorted(all_svs.keys()):
+		out_dict[k] = {}
+		for k2 in sorted(all_svs.keys()):
+			if k2 != k:
+				out_dict[k][k2] = copy.deepcopy(sv_filter(all_svs[k],all_svs[k2],op='intersect'))
+				print k, k2, len(out_dict[k][k2])
+	return out_dict
 
 

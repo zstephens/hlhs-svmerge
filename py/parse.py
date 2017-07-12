@@ -1,4 +1,5 @@
 import re
+import copy
 
 from sys_cmd import *
 
@@ -14,6 +15,54 @@ def bcf_2_vcf(BCFTOOLS, infile_list, outfile):
 		elif len(infile_list) > 1:
 			cmd = BCFTOOLS + ' merge -O v -o ' + outfile + ' ' + ' '.join(infile_list) + ' --force-samples'
 			exe(cmd)
+
+# write output files
+def write_output_file(filtered_variants,VAR_FILT,fn):
+	f = open(fn,'w')
+	# write variant filter parameters in header
+	for k in sorted(VAR_FILT.keys()):
+		f.write('##\t'+k+'\t'+str(VAR_FILT[k])+'\n')
+	# write all filtered SVs
+	for k in sorted(filtered_variants.keys()):
+		for svcs in filtered_variants[k]:
+			f.write('#\t'+k+'\t'+'\t'.join([str(n) for n in svcs[0][0:3]])+'\n')
+			for svc in svcs[1]:
+				f.write('\t'.join([str(n) for n in svc])+'\n')
+	f.close()
+
+# read input file
+def read_input_file(IN_FILE):
+	FILTERED_SVS = {}
+	f = open(IN_FILE,'r')
+	current_list = []
+	for line in f:
+		splt = line.strip().split('\t')
+		if splt[0] == '##':
+			continue
+		elif splt[0] == '#':
+			if len(current_list):
+				FILTERED_SVS[samp_name].append([(current_cc,current_lb,current_ub),copy.deepcopy(current_list)])
+			samp_name = splt[1]
+			if samp_name not in FILTERED_SVS:
+				FILTERED_SVS[samp_name] = []
+			current_cc = splt[2]
+			current_lb = int(splt[3])
+			current_ub = int(splt[4])
+			current_list = []
+		else:
+			tup1 = splt[4][1:-1].split(',')
+			tup2 = splt[5][1:-1].split(',')
+			tup3 = splt[6][1:-1].split(',')
+			if 'None' in tup3[1]:
+				tup3_parse = [tup3[0][1:-1],None]
+			else:
+				tup3_parse = [tup3[0][1:-1],float(tup3[1])]
+			current_list.append([splt[0],splt[1],int(splt[2]),int(splt[3]),(int(tup1[0]),int(tup1[1])),(int(tup2[0]),int(tup2[1])),(tup3_parse[0],tup3_parse[1])])
+	if len(current_list):
+			FILTERED_SVS[samp_name].append([(current_cc,current_lb,current_ub),copy.deepcopy(current_list)])
+	f.close()
+	return FILTERED_SVS
+
 
 ###############################################################################
 #                                                                             #
@@ -186,5 +235,97 @@ def parse_wandy(fn,VARIANT_FILTERS):
 
 	f.close()
 	return sv_list
+
+
+###############################################################################
+#                                                                             #
+#	SV FILTERS                                                                #
+#                                                                             #
+###############################################################################
+
+# remove exact duplicates
+def svfilter_unique(inList):
+	countDict = {}
+	outList = []
+	for i in xrange(len(inList)):
+		myKey = (inList[i][0],inList[i][1],inList[i][2],inList[i][3],inList[i][6][0])
+		if myKey not in countDict:
+			outList.append(inList[i])
+		countDict[myKey] = True
+	return outList
+
+# remove events on called on reference sequences we're not interested in
+def svfilter_chromWhitelist(inList,whitelist):
+	outList = []
+	for i in xrange(len(inList)):
+		ccoord = inList[i][1]
+		if ccoord in whitelist:
+			outList.append(inList[i])
+	return outList
+
+# separate events that intersect bed file (e.g. mappability, gene regions)
+#
+# intersect=True --> return events that intersect bed file
+# intersect=False -> return events that are outside bed regions
+#
+# input_is_cluster=True --> inList is a list of lists of events (clustered svs) instead of just list of events.
+#
+# mode="endpoint" --> only consider regions buffered around endpoint coordinates
+# mode="span" ------> consider entire span of event
+#
+def svfilter_bedIntersect(inList,mapTrack,intersect,mode,mapBuff=None,mapMax=None,input_is_cluster=False):
+	if mode == "endpoint":
+		if mapBuff == None or mapMax == None:
+			print "\nError: bedIntersect 'endpoint' method requires specifying mapBuff and mapMax.\n"
+			exit(1)
+	if mode == "span":
+		if mapMax == None:
+			print "\nError: bedIntersect 'span' method requires specifying mapMax.\n"
+			exit(1)
+
+	outList = []
+	for i in xrange(len(inList)):
+		if inList[i][0] in ['DUP','DEL','INV']:
+			ccoord = inList[i][1]
+			lcoord = inList[i][2]# + inList[i][4][0]
+			ucoord = inList[i][3]# + inList[i][5][1]
+
+			isInside = False
+
+			if mode == "endpoint":
+				lrange = (max([0,lcoord-mapBuff]),lcoord+mapBuff)
+				urange = (max([0,ucoord-mapBuff]),ucoord+mapBuff)
+				unmap_count_l   = mapTrack.query_range_faster(ccoord,lrange[0],lrange[1],query_endPointInclusive=True)
+				unmap_count_u   = mapTrack.query_range_faster(ccoord,urange[0],urange[1],query_endPointInclusive=True)
+				unmap_percent_l = unmap_count_l/float(2.*mapBuff)
+				unmap_percent_u = unmap_count_u/float(2.*mapBuff)
+				if unmap_percent_l > mapMax or unmap_percent_u > mapMax:
+					isInside = True
+
+			elif mode == "span":
+				unmap_count   = mapTrack.query_range_faster(ccoord,lcoord,ucoord,query_endPointInclusive=True)
+				unmap_percent = unmap_count/float(ucoord-lcoord)
+				if unmap_percent > mapMax:
+					isInside = True
+
+			else:
+				print "\nError: Unknown bedIntersect method.\n"
+				exit(1)
+			
+			if (isInside and intersect) or (not(isInside) and not(intersect)):
+				outList.append(inList[i])
+	return outList
+
+# remove events not supported by enough separate callers
+def svfilter_concordance(inCluster,concVal):
+	outCluster = []
+	for i in xrange(len(inCluster)):
+		callersFound = {}
+		for n in inCluster[i][1]:
+			callersFound[n[6][0]] = True
+		if len(callersFound) >= concVal:
+			outCluster.append(copy.deepcopy(inCluster[i]))
+	return outCluster
+
 
 

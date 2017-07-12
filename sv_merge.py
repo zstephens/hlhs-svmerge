@@ -27,9 +27,9 @@ SIM_PATH = '/'.join(os.path.realpath(__file__).split('/')[:-1])
 sys.path.append(SIM_PATH+'/py/')
 
 from sys_cmd import *
-from parse import parse_vcf, parse_cnvnator, parse_wandy, bcf_2_vcf
+from parse import *
 from mappability import MappabilityTrack
-from sv_comparison import sv_filter
+from sv_comparison import get_denovo, pairwise_all_samples
 
 DELLY_FILE_NAMES = ['delly.BND.bcf','delly.DEL.bcf','delly.DUP.bcf','delly.INV.bcf']
 
@@ -45,17 +45,22 @@ VAR_FILT = {'WHITELIST':True,	# only use variants from desired chromosomes (see 
             'WANDY_DUP':0.4,	# minimum log_2(depth) for dups in WANDY output
             'MAP_BUFF':150,		# how much to buffer around breakpoint regions when computing mappability
             'MAP_MAX':0.20,		# maximum percentage of sv allowed to overlap unmappable regions
+            'GAP_BUFF':150,		# how much to buffer around breakpoint regions when intersecting with gap track
+            'GAP_MAX':0.20,		# maximum percentage of sv allowed to overlap gap regions
             'CONC':2}			# how many SV callers must support the same event for it to be considered?
 
 parser = argparse.ArgumentParser(description='sv_merge.py')
 parser.add_argument('-i',             type=str,   required=True,  metavar='<str>',                                    help="* base_directory/")
+parser.add_argument('-o',             type=str,   required=True,  metavar='<str>',                                    help="* output_dir/")
 parser.add_argument('--sv-size-min',  type=int,   required=False, metavar='<int>',     default=VAR_FILT['SIZE_MIN'],  help="minimum allowable SV span [%(default)s]")
 parser.add_argument('--sv-size-max',  type=int,   required=False, metavar='<int>',     default=VAR_FILT['SIZE_MAX'],  help="maximum allowable SV span [%(default)s]")
 parser.add_argument('--wandy-del',    type=float, required=False, metavar='<float>',   default=VAR_FILT['WANDY_DEL'], help="maximum log_2(depth) for WANDY DEL calls [%(default)s]")
 parser.add_argument('--wandy-dup',    type=float, required=False, metavar='<float>',   default=VAR_FILT['WANDY_DUP'], help="minimum log_2(depth) for WANDY DUP calls [%(default)s]")
+parser.add_argument('--alt-track',    type=str,   required=False, metavar='<str>',     default='',                    help="alt track bed file")
+parser.add_argument('--gap-track',    type=str,   required=False, metavar='<str>',     default='',                    help="gap track bed file")
 parser.add_argument('--map-track',    type=str,   required=False, metavar='<str>',     default='',                    help="mappability track bed file")
-parser.add_argument('--map-buff',     type=int,   required=False, metavar='<int>',     default=VAR_FILT['MAP_BUFF'],  help="mappability buffer around breakpoints [%(default)s]")
-parser.add_argument('--map-max',      type=float, required=False, metavar='<float>',   default=VAR_FILT['MAP_MAX'],   help="maximum percentage of unmappable buffer [%(default)s]")
+parser.add_argument('--track-buff',   type=int,   required=False, metavar='<int>',     default=VAR_FILT['MAP_BUFF'],  help="up/downstream buffer for intersecting bed [%(default)s]")
+parser.add_argument('--track-thresh', type=float, required=False, metavar='<float>',   default=VAR_FILT['MAP_MAX'],   help="percent threshold for intersecting bed [%(default)s]")
 parser.add_argument('--concordance',  type=int,   required=False, metavar='<int>',     default=VAR_FILT['CONC'],      help="minimum concordance (#SV callers, <2 = OFF) [%(default)s]")
 parser.add_argument('--vcf-nofilter',             required=False, action='store_true', default=False,                 help='include VCF entries that fail QUAL filter')
 parser.add_argument('--no-whitelist',             required=False, action='store_true', default=False,                 help='include SVs from all chr (not just whitelist)')
@@ -66,14 +71,15 @@ args = parser.parse_args()
 
 # TODO: input value sanity-checking code
 
-BASE_INPUT_DIRECTORY = dir_format(args.i)
+BASE_INPUT_DIRECTORY  = dir_format(args.i)
+RESULTS_DIR           = dir_format(args.o)
 
 VAR_FILT['SIZE_MIN']  = args.sv_size_min
 VAR_FILT['SIZE_MAX']  = args.sv_size_max
 VAR_FILT['WANDY_DEL'] = args.wandy_del
 VAR_FILT['WANDY_DUP'] = args.wandy_dup
-VAR_FILT['MAP_BUFF']  = args.map_buff
-VAR_FILT['MAP_MAX']   = args.map_max
+VAR_FILT['MAP_BUFF']  = args.track_buff
+VAR_FILT['MAP_MAX']   = args.track_thresh
 VAR_FILT['CONC']      = args.concordance
 
 if args.vcf_nofilter:
@@ -85,7 +91,22 @@ if args.no_whitelist:
 (IN_FILE, OUT_FILE) = (args.file_in, args.file_out)
 
 BCFTOOLS = args.bcftools
-#BCFTOOLS = '/Users/zach/Desktop/bioinformatics/tools/bcftools'
+
+ALT_TRACK = args.alt_track
+if ALT_TRACK == '':
+	tryDefault = SIM_PATH+'/data/hg38_alt.bed'
+	if exists_and_is_nonZero(tryDefault):
+		print 'alt track not specified, using default:'
+		print '--',tryDefault
+	ALT_TRACK = tryDefault
+
+GAP_TRACK = args.gap_track
+if GAP_TRACK == '':
+	tryDefault = SIM_PATH+'/data/hg38_gap.bed'
+	if exists_and_is_nonZero(tryDefault):
+		print 'gap track not specified, using default:'
+		print '--',tryDefault
+	GAP_TRACK = tryDefault
 
 MAPPABILITY_TRACK = args.map_track
 if MAPPABILITY_TRACK == '':
@@ -94,8 +115,6 @@ if MAPPABILITY_TRACK == '':
 		print 'mappability track not specified, using default:'
 		print '--',tryDefault
 	MAPPABILITY_TRACK = tryDefault
-#MAPPABILITY_TRACK = '/Users/zach/Desktop/hlhs_summer_2017/hg19_e2_l300_mappabilityTrack.bed'
-
 
 
 ################################################################################
@@ -107,7 +126,9 @@ if MAPPABILITY_TRACK == '':
 
 def main():
 
-	myMappabilityTrack = MappabilityTrack(MAPPABILITY_TRACK)
+	myAltTrack = MappabilityTrack(ALT_TRACK)
+	myGapTrack = MappabilityTrack(GAP_TRACK)
+	myMapTrack = MappabilityTrack(MAPPABILITY_TRACK)
 
 	FILTERED_SVS = {}
 	if IN_FILE == '':
@@ -203,58 +224,29 @@ def main():
 			#
 			# PRUNE IDENTICAL VARIANTS
 			#
-			countDict = {}
-			all_svs_for_sample_unique = []
-			for i in xrange(len(all_svs_for_sample)):
-				myKey = (all_svs_for_sample[i][0],all_svs_for_sample[i][1],all_svs_for_sample[i][2],all_svs_for_sample[i][3],all_svs_for_sample[i][6][0])
-				if myKey not in countDict:
-					all_svs_for_sample_unique.append(all_svs_for_sample[i])
-				countDict[myKey] = True
-			del all_svs_for_sample
-			print '--',len(all_svs_for_sample_unique),'unique SVs...'
+			all_svs_for_sample = svfilter_unique(all_svs_for_sample)
+			print '--',len(all_svs_for_sample),'unique SVs...'
 
 			#
 			# FILTER BY CHROMOSOME
 			#
-			print '* applying chromosome whitelist filter...'
-			all_svs_for_sample_whitelist = []
-			for i in xrange(len(all_svs_for_sample_unique)):
-				ccoord = all_svs_for_sample_unique[i][1]
-				if ccoord in CHR_WHITELIST:
-					all_svs_for_sample_whitelist.append(all_svs_for_sample_unique[i])
-			del all_svs_for_sample_unique
-			print '--',len(all_svs_for_sample_whitelist),'SVs...'
+			all_svs_for_sample = svfilter_chromWhitelist(all_svs_for_sample,CHR_WHITELIST)
+			print '--',len(all_svs_for_sample),'SVs on whitelisted chroms...'
 
 			#
-			# FILTER BY MAPPABILITY
+			# FILTER BY MAPPABILITY AND GAP TRACK
 			#
-			print '* applying mappability filter...'
-			all_svs_for_sample_mappability_filtered = []
-			for i in xrange(len(all_svs_for_sample_whitelist)):
-				if all_svs_for_sample_whitelist[i][0] in ['DUP','DEL','INV']:
-					ccoord = all_svs_for_sample_whitelist[i][1]
-					lcoord = all_svs_for_sample_whitelist[i][2]# + all_svs_for_sample_whitelist[i][4][0]
-					ucoord = all_svs_for_sample_whitelist[i][3]# + all_svs_for_sample_whitelist[i][5][1]
-					lrange = (max([0,lcoord-VAR_FILT['MAP_BUFF']]),lcoord+VAR_FILT['MAP_BUFF'])
-					urange = (max([0,ucoord-VAR_FILT['MAP_BUFF']]),ucoord+VAR_FILT['MAP_BUFF'])
-					#unmap_count = myMappabilityTrack.query_range_faster(ccoord,lcoord,ucoord,query_endPointInclusive=True)
-					#unmap_perct = 100.*unmap_count/float(ucoord-lcoord+1)
-
-					unmap_count_l = myMappabilityTrack.query_range_faster(ccoord,lrange[0],lrange[1],query_endPointInclusive=True)
-					unmap_count_u = myMappabilityTrack.query_range_faster(ccoord,urange[0],urange[1],query_endPointInclusive=True)
-					unmap_percent_l = unmap_count_l/float(2.*VAR_FILT['MAP_BUFF'])
-					unmap_percent_u = unmap_count_u/float(2.*VAR_FILT['MAP_BUFF'])
-
-					if unmap_percent_l <= VAR_FILT['MAP_MAX'] and unmap_percent_u <= VAR_FILT['MAP_MAX']:
-						all_svs_for_sample_mappability_filtered.append(all_svs_for_sample_whitelist[i])
-			del all_svs_for_sample_whitelist
-			print '--',len(all_svs_for_sample_mappability_filtered),'SVs...'
+			all_svs_for_sample = svfilter_bedIntersect(all_svs_for_sample,myAltTrack,False,"endpoint",mapBuff=VAR_FILT['MAP_BUFF'],mapMax=VAR_FILT['MAP_MAX'])
+			print '--',len(all_svs_for_sample),'SVs in non-alt regions...'
+			all_svs_for_sample = svfilter_bedIntersect(all_svs_for_sample,myGapTrack,False,"endpoint",mapBuff=VAR_FILT['MAP_BUFF'],mapMax=VAR_FILT['MAP_MAX'])
+			print '--',len(all_svs_for_sample),'SVs in non-gap regions...'
+			all_svs_for_sample = svfilter_bedIntersect(all_svs_for_sample,myMapTrack,False,"endpoint",mapBuff=VAR_FILT['MAP_BUFF'],mapMax=VAR_FILT['MAP_MAX'])
+			print '--',len(all_svs_for_sample),'SVs in mappable regions...'
 
 			#
 			# SORT AND CLUSTER EVENTS
 			#
-			print '* sorting and clustering by position...'
-			sorted_svs  = sorted(all_svs_for_sample_mappability_filtered)
+			sorted_svs  = sorted(all_svs_for_sample)
 			sv_clusters = [[sorted_svs[0]]]
 			for i in xrange(1,len(sorted_svs)):
 				inPrevCluster = False
@@ -272,34 +264,21 @@ def main():
 				else:
 					sv_clusters.append([sorted_svs[i]])
 			del sorted_svs
-			print '--',len(sv_clusters),'SVs...'
-
-			####sorted_clusters = []
-			####for i in xrange(len(sv_clusters)):
-			####	lb = min([n[2]+n[4][0] for n in sv_clusters[i]])
-			####	ub = min([n[3]+n[5][1] for n in sv_clusters[i]])
-			####	sorted_clusters.append([(sv_clusters[i][0][1],lb,ub),copy.deepcopy(sv_clusters[i])])
-			####sorted_clusters = sorted(sorted_clusters)
-			####del sv_clusters
+			FILTERED_SVS[samp_name] = []
+			for i in xrange(len(sv_clusters)):
+				lb = min([n[2]+n[4][0] for n in sv_clusters[i]])
+				ub = min([n[3]+n[5][1] for n in sv_clusters[i]])
+				FILTERED_SVS[samp_name].append([(sv_clusters[i][0][1],lb,ub),copy.deepcopy(sv_clusters[i])])
+			FILTERED_SVS[samp_name] = sorted(FILTERED_SVS[samp_name])
+			del sv_clusters
+			print '--',len(FILTERED_SVS[samp_name]),'SV clusters...'
 
 			#
 			# APPLY CONCORDANCE FILTER
 			#
-			print '* applying concordance filter...'
-			FILTERED_SVS[samp_name] = []
-			for i in xrange(len(sv_clusters)):
-				callersFound = {}
-				for n in sv_clusters[i]:
-					callersFound[n[6][0]] = True
-				if len(callersFound) >= VAR_FILT['CONC']:
-					lb = min([n[2]+n[4][0] for n in sv_clusters[i]])
-					ub = min([n[3]+n[5][1] for n in sv_clusters[i]])
-					FILTERED_SVS[samp_name].append([(sv_clusters[i][0][1],lb,ub),copy.deepcopy(sv_clusters[i])])
-			del sv_clusters
-			FILTERED_SVS[samp_name] = sorted(FILTERED_SVS[samp_name])
-			print '--',len(FILTERED_SVS[samp_name]),'SVs...'
+			FILTERED_SVS[samp_name] = svfilter_concordance(FILTERED_SVS[samp_name],VAR_FILT['CONC'])
+			print '--',len(FILTERED_SVS[samp_name]),'SV clusters that pass concordance filter...'
 
-		#print time.time()-tt,'(sec)'
 
 	#
 	# OR SKIP ALL THAT AND READ IN FROM FILE, IF SPECIFIED.
@@ -307,41 +286,8 @@ def main():
 	else:
 		print 'reading input file...'
 		tt = time.time()
-		f = open(IN_FILE,'r')
-		current_list = []
-		for line in f:
-			splt = line.strip().split('\t')
-			if splt[0] == '##':
-				continue
-			elif splt[0] == '#':
-				if len(current_list):
-					FILTERED_SVS[samp_name].append([(current_cc,current_lb,current_ub),copy.deepcopy(current_list)])
-				samp_name = splt[1]
-				if samp_name not in FILTERED_SVS:
-					FILTERED_SVS[samp_name] = []
-				current_cc = splt[2]
-				current_lb = int(splt[3])
-				current_ub = int(splt[4])
-				current_list = []
-			else:
-				tup1 = splt[4][1:-1].split(',')
-				tup2 = splt[5][1:-1].split(',')
-				tup3 = splt[6][1:-1].split(',')
-				if 'None' in tup3[1]:
-					tup3_parse = [tup3[0][1:-1],None]
-				else:
-					tup3_parse = [tup3[0][1:-1],float(tup3[1])]
-				current_list.append([splt[0],splt[1],int(splt[2]),int(splt[3]),(int(tup1[0]),int(tup1[1])),(int(tup2[0]),int(tup2[1])),(tup3_parse[0],tup3_parse[1])])
-		if len(current_list):
-				FILTERED_SVS[samp_name].append([(current_cc,current_lb,current_ub),copy.deepcopy(current_list)])
-		f.close()
+		FILTERED_SVS = read_input_file(IN_FILE)
 		print time.time()-tt,'(sec)'
-
-	####for k in sorted(FILTERED_SVS.keys()):
-	####	print '----',k
-	####	for n in FILTERED_SVS[k]:
-	####		print n
-	####exit(1)
 
 	#
 	# SAVE SORTED/FILTERED SVS TO OUTPUT FILE, IF DESIRED.
@@ -349,92 +295,26 @@ def main():
 	if OUT_FILE != '':
 		print 'saving to output file...'
 		tt = time.time()
-		f = open(OUT_FILE,'w')
-		# write variant filter parameters in header
-		for k in sorted(VAR_FILT.keys()):
-			f.write('##\t'+k+'\t'+str(VAR_FILT[k])+'\n')
-		# write all filtered SVs
-		for k in sorted(FILTERED_SVS.keys()):
-			for svcs in FILTERED_SVS[k]:
-				f.write('#\t'+k+'\t'+'\t'.join([str(n) for n in svcs[0][0:3]])+'\n')
-				for svc in svcs[1]:
-					f.write('\t'.join([str(n) for n in svc])+'\n')
-		f.close()
+		write_output_file(FILTERED_SVS,VAR_FILT,OUT_FILE)
 		print time.time()-tt,'(sec)'
 
-
+	#
+	# OUTPUT DENOVO SVS
+	#
+	print 'finding denovo SVs...'
 	for k in sorted(FILTERED_SVS.keys()):
-		print k, len(FILTERED_SVS[k])
-	print '\n********************\n'
-
-	#
-	#
-	#
-	lab = [n[1][0][0] for n in FILTERED_SVS['011H-001']]
-	print 'DEL', lab.count('DEL')
-	print 'DUP', lab.count('DUP')
-	print 'INV', lab.count('INV')
-
-	print ''
-	lens = [len(n[1]) for n in FILTERED_SVS['011H-001']]
-	for i in xrange(1,5):
-		print i, lens.count(i)
-
-	one_count = {}
-	for n in FILTERED_SVS['011H-001']:
-		nCallers = {}
-		for m in n[1]:
-			nCallers[m[6][0]] = True
-		if len(nCallers) == 1:
-			k = nCallers.keys()[0]
-			if k not in one_count:
-				one_count[k] = 0
-			one_count[k] += 1
-	for k in one_count.keys():
-		print k, one_count[k],'{0:.2f}%'.format(100.*float(one_count[k])/8946.)
-
-	# remove father
-	print '\n*', len(FILTERED_SVS['011H-001']), '-->',
-	de_novo = sv_filter(FILTERED_SVS['011H-001'],FILTERED_SVS['011H-003'])
-	print len(de_novo),'-->',
-	# remove mother
-	de_novo = sv_filter(de_novo,FILTERED_SVS['011H-004'])
-	print len(de_novo),'-->',
-	# remove sister
-	de_novo = sv_filter(de_novo,FILTERED_SVS['011H-100'])
-	print len(de_novo),'-->',
-	# remove brother
-	de_novo = sv_filter(de_novo,FILTERED_SVS['011H-101'])
-	print len(de_novo),'de novo SVs'
-
-
-	lab = [n[1][0][0] for n in de_novo]
-	print 'DEL', lab.count('DEL')
-	print 'DUP', lab.count('DUP')
-	print 'INV', lab.count('INV')
-
-	print ''
-	lens = [len(n[1]) for n in de_novo]
-	for i in xrange(1,5):
-		print i, lens.count(i)
-
-	for i in xrange(len(de_novo)):
-		if len(de_novo[i][1]) == 4:
-			print ''
-			print de_novo[i][1]
-
-	one_count = {}
-	for n in de_novo:
-		nCallers = {}
-		for m in n[1]:
-			nCallers[m[6][0]] = True
-		if len(nCallers) == 1:
-			k = nCallers.keys()[0]
-			if k not in one_count:
-				one_count[k] = 0
-			one_count[k] += 1
-	for k in one_count.keys():
-		print k, one_count[k],'{0:.2f}%'.format(100.*float(one_count[k])/3890.)
+		suffix = k.split('-')[1]
+		rdir   = RESULTS_DIR+k+'_denovo/'
+		if suffix == '001':
+			print '--',k
+			makedir(rdir)
+			myDenovo = {}
+			myDenovo[k] = get_denovo(FILTERED_SVS,k)
+			if len(myDenovo[k]):
+				rout = rdir+k+'_denovo.txt'
+				write_output_file(myDenovo,VAR_FILT,rout)
+	
+	#pairwise_all_samples(FILTERED_SVS)
 
 
 if __name__ == '__main__':
